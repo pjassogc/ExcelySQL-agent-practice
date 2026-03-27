@@ -8,7 +8,7 @@ Uso
 
 El script:
     1. Valida y carga el archivo Excel en un DataFrame.
-    2. Construye las herramientas (get_dataframe_info, list_sheets, python_repl).
+    2. Construye las herramientas (get_dataframe_info, list_sheets, python_repl, generate_chart).
     3. Construye el agente LangGraph ReAct con MemorySaver.
     4. Entra en un bucle de chat en terminal con Rich.
 
@@ -19,12 +19,15 @@ Teaching points:
     - dotenv carga OPENAI_API_KEY de forma transparente.
 """
 
+import platform
+import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
+from langchain_core.messages import ToolMessage
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -40,6 +43,7 @@ load_dotenv()
 console = Console()
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls"}
+CHART_PREFIX = "CHART:"
 
 
 def load_excel(path: str) -> tuple[pd.DataFrame, str]:
@@ -70,7 +74,7 @@ def print_welcome(excel_path: str, df: pd.DataFrame) -> None:
         f"[bold cyan]Filas:[/] {len(df):,}   "
         f"[bold cyan]Columnas:[/] {len(df.columns)}\n"
         f"[bold cyan]Columnas:[/] {', '.join(df.columns.tolist())}\n\n"
-        "[dim]Escribe tu pregunta en lenguaje natural. Escribe [bold]salir[/] para terminar.[/dim]"
+        "[dim]Escribe tu pregunta o pide una gráfica. Escribe [bold]salir[/] para terminar.[/dim]"
     )
     console.print(Panel(info, title="[bold green]Agente Analista de Excel[/]", border_style="green"))
 
@@ -143,6 +147,22 @@ def main() -> None:
         answer = extract_final_answer(result)
         console.print()
         console.print(Panel(Markdown(answer), title="[bold green]Agente[/]", border_style="green"))
+        _handle_charts(result)
+
+
+def _handle_charts(result: dict) -> None:
+    """Detecta gráficas generadas y las abre con el visor del sistema."""
+    for msg in result.get("messages", []):
+        if isinstance(msg, ToolMessage) and msg.content.startswith(CHART_PREFIX):
+            path = msg.content[len(CHART_PREFIX):]
+            console.print(f"\n[bold yellow]📊 Gráfica guardada:[/] {path}")
+            try:
+                if platform.system() == "Darwin":
+                    subprocess.run(["open", path], check=True)
+                elif platform.system() == "Linux":
+                    subprocess.run(["xdg-open", path], check=True)
+            except Exception:
+                pass  # Si no hay visor disponible, solo mostramos la ruta
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
 """
 tools.py — Herramientas LangChain para el agente analista de Excel.
 
-Se exponen tres herramientas:
+Se exponen cuatro herramientas:
     1. get_dataframe_info  — Schema + muestra de datos (llama primero a esta)
     2. list_sheets         — Lista todas las hojas del workbook
     3. python_repl         — Ejecuta código pandas arbitrario vía parsing AST
+    4. generate_chart      — Genera gráficas matplotlib y devuelve la ruta PNG
 
 Teaching points:
     - El decorador @tool convierte una función normal en un BaseTool de LangChain.
@@ -21,6 +22,7 @@ Public API
 """
 
 import io
+import tempfile
 from typing import Any
 
 import pandas as pd
@@ -128,7 +130,74 @@ def build_tools(df: pd.DataFrame, excel_path: str) -> list[Any]:
         ),
     )
 
-    return [get_dataframe_info, list_sheets, repl]
+    # ------------------------------------------------------------------
+    # Herramienta 4: generate_chart
+    # ------------------------------------------------------------------
+    # Usamos exec() en lugar de PythonAstREPLTool porque necesitamos
+    # ejecutar el código Y luego llamar a plt.savefig() nosotros.
+    # compile() proporciona mejores mensajes de error que exec() directo.
+    # matplotlib.use("Agg") establece el backend sin ventana gráfica,
+    # necesario en servidores y en Streamlit.
+    # ------------------------------------------------------------------
+    @tool
+    def generate_chart(code: str) -> str:
+        """
+        Genera una gráfica ejecutando código matplotlib y la guarda como PNG.
+
+        IMPORTANTE: NO llames a plt.show(). La figura se guarda automáticamente.
+
+        Args:
+            code: Código Python que crea una figura matplotlib.
+
+        Variables disponibles:
+            df          — DataFrame principal
+            all_sheets  — dict {nombre_hoja: DataFrame}
+            pd          — pandas
+            plt         — matplotlib.pyplot
+
+        Ejemplos:
+
+            # Gráfico de barras horizontal por región
+            fig, ax = plt.subplots(figsize=(10, 6))
+            df.groupby('region')['total_revenue'].sum().sort_values().plot(kind='barh', ax=ax)
+            ax.set_title('Revenue por región')
+
+            # Serie temporal mensual
+            fig, ax = plt.subplots(figsize=(12, 5))
+            df.set_index('date')['total_revenue'].resample('ME').sum().plot(ax=ax)
+            ax.set_title('Revenue mensual 2024')
+
+            # Pie chart combinando hojas
+            fig, ax = plt.subplots(figsize=(8, 8))
+            merged = pd.merge(all_sheets['Sales'], all_sheets['Clients'], on='client_id')
+            merged.groupby('segment')['total_revenue'].sum().plot(kind='pie', ax=ax, autopct='%1.1f%%')
+            ax.set_title('Revenue por segmento de cliente')
+
+        Returns:
+            "CHART:/ruta/al/archivo.png" si tiene éxito, o mensaje de error.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        local_ns = {
+            "df": df,
+            "all_sheets": all_sheets,
+            "pd": pd,
+            "plt": plt,
+        }
+
+        try:
+            exec(compile(code, "<chart>", "exec"), local_ns)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png", prefix="chart_")
+            plt.savefig(tmp.name, bbox_inches="tight", dpi=150)
+            plt.close("all")
+            return f"CHART:{tmp.name}"
+        except Exception as exc:
+            plt.close("all")
+            return f"Error al generar la gráfica: {exc}"
+
+    return [get_dataframe_info, list_sheets, repl, generate_chart]
 
 
 def _pick_engine(path: str) -> str:

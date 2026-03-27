@@ -13,6 +13,8 @@ Teaching points:
     - thread_id fijo por sesión → memoria multi-turno automática vía MemorySaver.
     - Las llamadas a herramientas se muestran en un expander para que el usuario
       vea el razonamiento del agente (transparencia del proceso ReAct).
+    - generate_chart devuelve "CHART:/ruta.png". Detectamos ese prefijo tras
+      graph.invoke() y mostramos la imagen inline con st.image().
 """
 
 import os
@@ -135,6 +137,18 @@ def _extract_tool_calls(result: dict) -> list[dict]:
     return calls
 
 
+CHART_PREFIX = "CHART:"
+
+
+def _extract_chart_paths(tool_calls: list[dict]) -> list[str]:
+    """Extrae las rutas PNG de los outputs de generate_chart."""
+    return [
+        tc["output"][len(CHART_PREFIX):]
+        for tc in tool_calls
+        if isinstance(tc.get("output"), str) and tc["output"].startswith(CHART_PREFIX)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -194,10 +208,11 @@ if st.session_state.graph is None:
         - *"¿Cuál es el valor medio de pedido por región?"*
         - *"¿Qué segmento de clientes genera más ingresos?"*
 
-        El agente usa un bucle LangGraph ReAct con tres herramientas:
+        El agente dispone de cuatro herramientas:
         - **get_dataframe_info** — schema, estadísticas, filas de muestra
         - **list_sheets** — nombres de hojas del workbook
         - **python_repl** — código pandas arbitrario via parsing AST
+        - **generate_chart** — gráficas matplotlib inline
 
         La memoria multi-turno se mantiene durante toda la sesión.
         """
@@ -217,20 +232,22 @@ st.markdown("---")
 for entry in st.session_state.messages:
     with st.chat_message(entry["role"]):
         st.markdown(entry["content"])
+        for path in entry.get("charts", []):
+            st.image(path, use_container_width=True)
         if entry.get("tool_calls"):
             with st.expander("🔧 Llamadas a herramientas", expanded=False):
                 for tc in entry["tool_calls"]:
                     st.markdown(f"**`{tc['name']}`**")
                     if tc["input"]:
                         st.json(tc["input"])
-                    if tc["output"]:
+                    if tc["output"] and not tc["output"].startswith(CHART_PREFIX):
                         st.code(tc["output"], language="text")
 
 # ---------------------------------------------------------------------------
 # Input de chat
 # ---------------------------------------------------------------------------
 
-if prompt := st.chat_input("Haz una pregunta sobre tus datos…"):
+if prompt := st.chat_input("Haz una pregunta o pide una gráfica…"):
     # Mostrar el mensaje del usuario inmediatamente
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -252,13 +269,18 @@ if prompt := st.chat_input("Haz una pregunta sobre tus datos…"):
                 tool_calls = []
 
         st.markdown(answer)
+
+        chart_paths = _extract_chart_paths(tool_calls)
+        for path in chart_paths:
+            st.image(path, use_container_width=True)
+
         if tool_calls:
             with st.expander("🔧 Llamadas a herramientas", expanded=False):
                 for tc in tool_calls:
                     st.markdown(f"**`{tc['name']}`**")
                     if tc["input"]:
                         st.json(tc["input"])
-                    if tc["output"]:
+                    if tc["output"] and not tc["output"].startswith(CHART_PREFIX):
                         st.code(tc["output"], language="text")
 
     # Guardar en el historial
@@ -266,4 +288,5 @@ if prompt := st.chat_input("Haz una pregunta sobre tus datos…"):
         "role": "assistant",
         "content": answer,
         "tool_calls": tool_calls,
+        "charts": chart_paths,
     })
