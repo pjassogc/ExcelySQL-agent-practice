@@ -1,23 +1,23 @@
 """
-app.py — Interfaz web Streamlit para el agente analista de Excel.
+app.py — Interfaz web Streamlit con selector de agente (Excel / SQL).
 
 Uso
 ---
     streamlit run app.py
 
 Teaching points:
-    - Streamlit re-ejecuta el script entero en cada interacción del usuario.
-      session_state es el escape hatch para todo lo que debe persistir entre reruns.
-    - Reutilizamos agent.py, tools.py y state.py sin modificarlos.
-      Streamlit es únicamente una capa de UI.
-    - thread_id fijo por sesión → memoria multi-turno automática vía MemorySaver.
-    - Las llamadas a herramientas se muestran en un expander para que el usuario
-      vea el razonamiento del agente (transparencia del proceso ReAct).
-    - generate_chart devuelve "CHART:/ruta.png". Detectamos ese prefijo tras
-      graph.invoke() y mostramos la imagen inline con st.image().
+    - Dos agentes distintos comparten el mismo bucle de chat: graph.invoke()
+      tiene la misma interfaz independientemente de qué tools tenga el agente.
+    - Al cambiar de agente se limpian las claves del anterior y se llama a
+      st.rerun(); el nuevo agente se construye en el siguiente render.
+    - _render_excel_sidebar() y _render_sql_sidebar() encapsulan la
+      inicialización de cada agente; el resto del código no sabe cuál está activo.
+    - generate_chart devuelve "CHART:/ruta.png"; detectamos ese prefijo y
+      mostramos la imagen inline con st.image().
 """
 
 import os
+import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
@@ -28,52 +28,52 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, ToolMessage
 
 from agent import build_agent
+from sql_agent import build_sql_agent
+from sql_tools import build_sql_tools
 from tools import build_tools, _pick_engine
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuración de página (debe ser la primera llamada a Streamlit)
+# Configuración de página
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Agente Analista de Excel",
-    page_icon="📊",
+    page_title="Agente Analista",
+    page_icon="🤖",
     layout="wide",
 )
 
 # ---------------------------------------------------------------------------
 # Inicialización de session_state
 # ---------------------------------------------------------------------------
-# Estas claves se establecen una sola vez; los reruns posteriores
-# saltan los bloques `not in`.
-
+if "agent_type" not in st.session_state:
+    st.session_state.agent_type = "excel"   # "excel" | "sql"
 if "graph" not in st.session_state:
-    st.session_state.graph = None           # CompiledGraph | None
+    st.session_state.graph = None
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
-    st.session_state.messages = []          # list[dict] — {role, content, tool_calls}
+    st.session_state.messages = []
+# Excel-specific
 if "excel_path" not in st.session_state:
-    st.session_state.excel_path = None      # str ruta al archivo temporal
+    st.session_state.excel_path = None
 if "df" not in st.session_state:
-    st.session_state.df = None              # pd.DataFrame
+    st.session_state.df = None
 if "all_sheets" not in st.session_state:
-    st.session_state.all_sheets = {}        # dict[str, pd.DataFrame]
+    st.session_state.all_sheets = {}
+# SQL-specific
+if "db_path" not in st.session_state:
+    st.session_state.db_path = None
+
+CHART_PREFIX = "CHART:"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — inicialización de agentes
 # ---------------------------------------------------------------------------
 
-def _load_and_build(uploaded_file) -> None:
-    """
-    Guarda el archivo subido en un fichero temporal, lo carga en un
-    DataFrame, construye las herramientas y el agente, y almacena todo
-    en session_state.
-
-    Por qué un fichero temporal: pandas/openpyxl necesitan un archivo
-    real en disco (con seek) para leer .xlsx correctamente.
-    """
+def _load_excel_agent(uploaded_file) -> None:
+    """Carga el Excel subido y construye el agente Excel."""
     suffix = Path(uploaded_file.name).suffix.lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -82,17 +82,29 @@ def _load_and_build(uploaded_file) -> None:
     engine = _pick_engine(tmp_path)
     df = pd.read_excel(tmp_path, engine=engine)
     all_sheets = pd.read_excel(tmp_path, sheet_name=None, engine=engine)
-
     tools = build_tools(df, tmp_path)
     graph = build_agent(tools)
 
-    st.session_state.graph = graph
-    st.session_state.excel_path = tmp_path
-    st.session_state.df = df
-    st.session_state.all_sheets = all_sheets
-    # Resetear conversación al cargar un archivo nuevo
-    st.session_state.messages = []
-    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.update({
+        "graph": graph,
+        "excel_path": tmp_path,
+        "df": df,
+        "all_sheets": all_sheets,
+        "messages": [],
+        "thread_id": str(uuid.uuid4()),
+    })
+
+
+def _load_sql_agent(db_path: str) -> None:
+    """Carga la BD SQLite y construye el agente SQL."""
+    tools = build_sql_tools(db_path)
+    graph = build_sql_agent(tools)
+    st.session_state.update({
+        "graph": graph,
+        "db_path": db_path,
+        "messages": [],
+        "thread_id": str(uuid.uuid4()),
+    })
 
 
 def _reset_session() -> None:
@@ -102,10 +114,13 @@ def _reset_session() -> None:
     st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Helpers — extracción de respuesta y tool calls
+# ---------------------------------------------------------------------------
+
 def extract_final_answer(result: dict) -> str:
     """Extrae el último AIMessage con texto de la respuesta del agente."""
-    messages = result.get("messages", [])
-    for msg in reversed(messages):
+    for msg in reversed(result.get("messages", [])):
         if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
             if not getattr(msg, "tool_calls", None):
                 return msg.content
@@ -113,20 +128,14 @@ def extract_final_answer(result: dict) -> str:
 
 
 def _extract_tool_calls(result: dict) -> list[dict]:
-    """
-    Devuelve lista de {name, input, output} de las llamadas a herramientas.
-    Se usa para poblar el expander de Tool calls.
-    """
-    calls = []
-    messages = result.get("messages", [])
-
-    # Índice tool_call_id → output del ToolMessage
+    """Devuelve lista de {name, input, output} de las llamadas a herramientas."""
     tool_outputs: dict[str, str] = {}
-    for msg in messages:
+    for msg in result.get("messages", []):
         if isinstance(msg, ToolMessage):
             tool_outputs[msg.tool_call_id] = msg.content
 
-    for msg in messages:
+    calls = []
+    for msg in result.get("messages", []):
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 calls.append({
@@ -135,9 +144,6 @@ def _extract_tool_calls(result: dict) -> list[dict]:
                     "output": tool_outputs.get(tc["id"], ""),
                 })
     return calls
-
-
-CHART_PREFIX = "CHART:"
 
 
 def _extract_chart_paths(tool_calls: list[dict]) -> list[str]:
@@ -150,83 +156,143 @@ def _extract_chart_paths(tool_calls: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar — secciones por tipo de agente
 # ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.title("📊 Agente Excel")
-    st.markdown("---")
-
-    uploaded = st.file_uploader(
-        "Sube un archivo Excel",
-        type=["xlsx", "xls"],
-        help="Formatos soportados: .xlsx, .xls",
-    )
-
+def _render_excel_sidebar() -> None:
+    """Sidebar para el agente Excel: file uploader + info del workbook."""
+    uploaded = st.file_uploader("Sube un archivo Excel", type=["xlsx", "xls"])
     if uploaded is not None:
-        # Reconstruir solo cuando se sube un archivo *nuevo* (por nombre + tamaño)
         file_key = f"{uploaded.name}_{uploaded.size}"
         if st.session_state.get("_file_key") != file_key:
-            with st.spinner("Cargando archivo y construyendo agente…"):
-                _load_and_build(uploaded)
+            with st.spinner("Cargando Excel y construyendo agente…"):
+                _load_excel_agent(uploaded)
             st.session_state["_file_key"] = file_key
             st.success("¡Agente listo!")
 
+    if st.session_state.df is not None:
+        df = st.session_state.df
+        st.markdown(f"**Filas:** {len(df):,}  |  **Cols:** {len(df.columns)}")
+        for name, sdf in st.session_state.all_sheets.items():
+            st.markdown(f"&nbsp;&nbsp;• `{name}` — {len(sdf):,} filas")
+
+
+def _render_sql_sidebar() -> None:
+    """Sidebar para el agente SQL: auto-carga sample.db, botón para generarla si no existe."""
+    db_path = Path("data/sample.db")
+
+    if not db_path.exists():
+        st.warning("No se encontró `data/sample.db`")
+        st.code("python generate_db.py", language="bash")
+        if st.button("⚡ Generar ahora", use_container_width=True):
+            from generate_db import main as _gen
+            with st.spinner("Generando base de datos…"):
+                _gen()
+            st.rerun()
+        return
+
+    # Auto-cargar la BD la primera vez que se activa el agente SQL
+    if st.session_state.graph is None:
+        with st.spinner("Construyendo agente SQL…"):
+            _load_sql_agent(str(db_path))
+        st.rerun()
+
+    st.success("Base de datos cargada")
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+    st.markdown(f"**Tablas ({len(tables)}):**")
+    for (name,) in tables:
+        count = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        st.markdown(f"&nbsp;&nbsp;• `{name}` — {count:,} filas")
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar principal
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.title("🤖 Agente Analista")
+
+    agent_choice = st.radio(
+        "Tipo de agente",
+        ["📊 Excel", "🗄️ SQL"],
+        horizontal=True,
+    )
+    selected_type = "excel" if "Excel" in agent_choice else "sql"
+
+    # Al cambiar de agente: limpiar estado anterior y redibujar
+    if selected_type != st.session_state.agent_type:
+        for k in ["graph", "messages", "excel_path", "df",
+                  "all_sheets", "db_path", "_file_key"]:
+            st.session_state.pop(k, None)
+        st.session_state.agent_type = selected_type
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.rerun()
+
     st.markdown("---")
 
+    if st.session_state.agent_type == "excel":
+        _render_excel_sidebar()
+    else:
+        _render_sql_sidebar()
+
+    st.markdown("---")
+
+    st.markdown(f"**Modelo:** `{os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}`")
     if st.button("🔄 Nueva sesión", use_container_width=True):
         _reset_session()
 
-    # Info del archivo cargado
-    if st.session_state.df is not None:
-        df = st.session_state.df
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        st.markdown(f"**Modelo:** `{model_name}`")
-        st.markdown(f"**Filas:** {len(df):,}  |  **Columnas:** {len(df.columns)}")
-        sheet_names = list(st.session_state.all_sheets.keys())
-        st.markdown(f"**Hojas ({len(sheet_names)}):**")
-        for name in sheet_names:
-            n_rows = len(st.session_state.all_sheets[name])
-            st.markdown(f"&nbsp;&nbsp;• `{name}` — {n_rows:,} filas")
-
 
 # ---------------------------------------------------------------------------
-# Área principal
+# Área principal — pantalla de bienvenida (sin agente activo)
 # ---------------------------------------------------------------------------
+
+WELCOME = {
+    "excel": """
+# Agente Analista de Excel 📊
+Sube un archivo Excel en el panel lateral para empezar.
+
+**Herramientas disponibles:**
+- `get_dataframe_info` — schema, estadísticas, filas de muestra
+- `list_sheets` — hojas del workbook
+- `python_repl` — código pandas arbitrario
+- `generate_chart` — gráficas matplotlib inline
+""",
+    "sql": """
+# Agente Analista SQL 🗄️
+La base de datos se carga automáticamente desde `data/sample.db`.
+
+**Herramientas disponibles:**
+- `list_tables` — tablas disponibles en la BD
+- `describe_table` — schema y muestra de una tabla
+- `run_sql` — consultas SELECT con JOIN entre tablas
+- `generate_chart` — gráficas matplotlib inline
+""",
+}
 
 if st.session_state.graph is None:
-    # Pantalla de bienvenida antes de subir un archivo
-    st.markdown(
-        """
-        # Bienvenido al Agente Analista de Excel 📊
-
-        Sube un archivo Excel en el panel lateral para empezar.
-
-        **Qué puedes preguntar:**
-        - *"¿Qué columnas tiene este archivo?"*
-        - *"Muéstrame los 5 productos con más revenue"*
-        - *"¿Cuál es el valor medio de pedido por región?"*
-        - *"¿Qué segmento de clientes genera más ingresos?"*
-
-        El agente dispone de cuatro herramientas:
-        - **get_dataframe_info** — schema, estadísticas, filas de muestra
-        - **list_sheets** — nombres de hojas del workbook
-        - **python_repl** — código pandas arbitrario via parsing AST
-        - **generate_chart** — gráficas matplotlib inline
-
-        La memoria multi-turno se mantiene durante toda la sesión.
-        """
-    )
+    st.markdown(WELCOME[st.session_state.agent_type])
     st.stop()
 
-# Cabecera con info del archivo
-excel_name = Path(st.session_state.excel_path).name if st.session_state.excel_path else "unknown"
-df = st.session_state.df
-st.markdown(f"### 📁 `{excel_name}` &nbsp;—&nbsp; {len(df):,} filas × {len(df.columns)} columnas")
+# Cabecera dinámica según tipo de agente
+if st.session_state.agent_type == "excel" and st.session_state.excel_path:
+    excel_name = Path(st.session_state.excel_path).name
+    df = st.session_state.df
+    st.markdown(
+        f"### 📁 `{excel_name}` &nbsp;—&nbsp; {len(df):,} filas × {len(df.columns)} columnas"
+    )
+elif st.session_state.agent_type == "sql" and st.session_state.db_path:
+    db_name = Path(st.session_state.db_path).name
+    st.markdown(f"### 🗄️ `{db_name}`")
+
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
-# Historial de chat
+# Historial de chat — idéntico para ambos agentes
 # ---------------------------------------------------------------------------
 
 for entry in st.session_state.messages:
@@ -244,16 +310,14 @@ for entry in st.session_state.messages:
                         st.code(tc["output"], language="text")
 
 # ---------------------------------------------------------------------------
-# Input de chat
+# Input de chat — idéntico para ambos agentes
 # ---------------------------------------------------------------------------
 
 if prompt := st.chat_input("Haz una pregunta o pide una gráfica…"):
-    # Mostrar el mensaje del usuario inmediatamente
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Invocar el agente
     config = {"configurable": {"thread_id": st.session_state.thread_id}}
     with st.chat_message("assistant"):
         with st.spinner("El agente está pensando…"):
@@ -283,7 +347,6 @@ if prompt := st.chat_input("Haz una pregunta o pide una gráfica…"):
                     if tc["output"] and not tc["output"].startswith(CHART_PREFIX):
                         st.code(tc["output"], language="text")
 
-    # Guardar en el historial
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
