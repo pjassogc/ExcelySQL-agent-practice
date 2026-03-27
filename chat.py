@@ -1,0 +1,149 @@
+"""
+chat.py — Punto de entrada para el agente analista de Excel.
+
+Uso
+---
+    python chat.py data/sample.xlsx     # pasar el archivo directamente
+    python chat.py                      # pedirá la ruta
+
+El script:
+    1. Valida y carga el archivo Excel en un DataFrame.
+    2. Construye las herramientas (get_dataframe_info, list_sheets, python_repl).
+    3. Construye el agente LangGraph ReAct con MemorySaver.
+    4. Entra en un bucle de chat en terminal con Rich.
+
+Teaching points:
+    - thread_id fijo por sesión: todos los mensajes comparten el mismo
+      checkpoint de MemorySaver, dando memoria multi-turno automática.
+    - Rich proporciona color y paneles sin ensuciar la lógica.
+    - dotenv carga OPENAI_API_KEY de forma transparente.
+"""
+
+import sys
+import uuid
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+
+from agent import build_agent
+from tools import build_tools, _pick_engine
+
+# Carga las variables de entorno desde .env antes que nada
+load_dotenv()
+
+console = Console()
+
+SUPPORTED_EXTENSIONS = {".xlsx", ".xls"}
+
+
+def load_excel(path: str) -> tuple[pd.DataFrame, str]:
+    """
+    Carga la primera hoja de un archivo Excel en un DataFrame.
+
+    Returns
+    -------
+    (df, ruta_resuelta)
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        console.print(f"[bold red]Error:[/] Archivo no encontrado: {p}")
+        sys.exit(1)
+    if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        console.print(f"[bold red]Error:[/] Formato no soportado '{p.suffix}'. Usa .xlsx o .xls")
+        sys.exit(1)
+
+    engine = _pick_engine(str(p))
+    df = pd.read_excel(str(p), engine=engine)
+    return df, str(p)
+
+
+def print_welcome(excel_path: str, df: pd.DataFrame) -> None:
+    """Imprime el banner de bienvenida con información del archivo."""
+    info = (
+        f"[bold cyan]Archivo:[/] {excel_path}\n"
+        f"[bold cyan]Filas:[/] {len(df):,}   "
+        f"[bold cyan]Columnas:[/] {len(df.columns)}\n"
+        f"[bold cyan]Columnas:[/] {', '.join(df.columns.tolist())}\n\n"
+        "[dim]Escribe tu pregunta en lenguaje natural. Escribe [bold]salir[/] para terminar.[/dim]"
+    )
+    console.print(Panel(info, title="[bold green]Agente Analista de Excel[/]", border_style="green"))
+
+
+def extract_final_answer(result: dict) -> str:
+    """
+    Extrae el texto del último mensaje AI del resultado del agente.
+
+    create_react_agent devuelve {"messages": [...]} donde el último mensaje
+    es siempre el AIMessage final.
+    """
+    messages = result.get("messages", [])
+    for msg in reversed(messages):
+        if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+            # Ignoramos los mensajes que solo contienen llamadas a herramientas
+            tool_calls = getattr(msg, "tool_calls", None)
+            if not tool_calls:
+                return msg.content
+    return "(Sin respuesta generada)"
+
+
+def main() -> None:
+    # ---- Resolver ruta del archivo ----------------------------------------
+    if len(sys.argv) > 1:
+        excel_path_arg = sys.argv[1]
+    else:
+        excel_path_arg = Prompt.ask("[bold yellow]Ruta al archivo Excel[/]")
+
+    df, excel_path = load_excel(excel_path_arg)
+
+    # ---- Construir agente --------------------------------------------------
+    with console.status("[bold green]Cargando Excel y construyendo agente…[/]"):
+        tools = build_tools(df, excel_path)
+        graph = build_agent(tools)
+
+    print_welcome(excel_path, df)
+
+    # ---- Bucle de chat -----------------------------------------------------
+    # thread_id fijo significa que todos los turnos comparten el mismo
+    # checkpoint de MemorySaver.
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    while True:
+        console.print()
+        try:
+            user_input = Prompt.ask("[bold blue]Tú[/]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]¡Hasta luego![/dim]")
+            break
+
+        if user_input.strip().lower() in {"salir", "exit", "quit", "q"}:
+            console.print("[dim]¡Hasta luego![/dim]")
+            break
+
+        if not user_input.strip():
+            continue
+
+        # Invocar el agente
+        console.print(Rule("[dim]Agente pensando…[/dim]", style="dim"))
+        try:
+            result = graph.invoke(
+                {"messages": [("human", user_input)]},
+                config=config,
+            )
+        except Exception as exc:
+            console.print(f"[bold red]Error del agente:[/] {exc}")
+            continue
+
+        answer = extract_final_answer(result)
+        console.print()
+        console.print(Panel(Markdown(answer), title="[bold green]Agente[/]", border_style="green"))
+
+
+if __name__ == "__main__":
+    main()
