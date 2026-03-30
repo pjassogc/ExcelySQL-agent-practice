@@ -1,7 +1,7 @@
 # Solución Paso 1 — Agente LangGraph para análisis de Excel
 
 Guía paso a paso con todo el código listo para copiar y pegar.
-Duración estimada: 60-90 min.
+Duración estimada: 60-90 min. 
 
 ---
 

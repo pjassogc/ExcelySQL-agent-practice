@@ -1,8 +1,8 @@
 # Solución Paso 2 — UI web con Streamlit
 
-Partimos de la solución del Paso 1 (agente terminal) y añadimos una interfaz web con **Streamlit** sin tocar nada de `agent.py`, `tools.py` ni `state.py`.
+Partimos de la solución del Paso 1 (agente terminal) y añadimos una interfaz web con **Streamlit** sin tocar nada de `agent.py`, `tools.py` ni `state.py`. 
 
-Duración estimada: 45-60 min.
+Duración estimada: 45-60 min. 
 
 ---
 

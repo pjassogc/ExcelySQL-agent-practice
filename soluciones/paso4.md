@@ -2,7 +2,7 @@
 
 Partimos del Paso 3 y añadimos un segundo agente que habla con una base de datos SQLite en lugar de un Excel. La UI permite cambiar entre ambos agentes sin recargar la página.
 
-Duración estimada: 60-90 min.
+Duración estimada: 60-90 min. 
 
 ---
 

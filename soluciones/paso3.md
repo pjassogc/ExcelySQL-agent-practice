@@ -2,7 +2,7 @@
 
 Partimos del Paso 2 (agente + UI Streamlit) y añadimos la capacidad de generar gráficas matplotlib directamente desde el chat.
 
-Duración estimada: 45-60 min.
+Duración estimada: 45-60 min. 
 
 ---
 
