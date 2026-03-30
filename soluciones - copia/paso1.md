@@ -473,3 +473,5 @@ Muéstrame un ranking de los 10 clientes por revenue total
    - Añadir autenticación para el `thread_id`
    - Limitar el tamaño del historial con un `trimmer` de mensajes
    - Añadir un tool de `write_excel` para exportar resultados
+
+
